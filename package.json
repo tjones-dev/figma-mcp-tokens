@@ -1,0 +1,29 @@
+{
+  "name": "figma-mcp-tokens",
+  "version": "0.1.0",
+  "description": "Design tokens from Figma variables and styles, exported through the Figma MCP server.",
+  "license": "UNLICENSED",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "figma-mcp-tokens": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.json",
+    "check": "pnpm typecheck && pnpm test && node scripts/build.mjs --check"
+  },
+  "devDependencies": {
+    "@types/node": "20.19.43",
+    "typescript": "7.0.2",
+    "vitest": "5.0.5"
+  }
+}
