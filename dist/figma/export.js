@@ -1,3 +1,4 @@
+// Pass this whole script, unchanged, as the code of the Figma MCP use_figma tool.
 // Runs inside Figma through the Figma MCP server's `use_figma` tool, not in Node:
 // `figma-mcp-tokens script` fills in the placeholders below and prints this file. It only
 // reads. It dumps every local variable (with aliases, scopes and WEB code syntax) and every

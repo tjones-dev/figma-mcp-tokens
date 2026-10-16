@@ -1,11 +1,16 @@
 // The CLI's commands. Each returns the lines to print; warnings are prefixed "Warning:".
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname, relative, sep } from "node:path";
+import { dirname, join, relative, sep } from "node:path";
 import { buildOutputs } from "./build.js";
+import { CONFIG_FILE, figmaFileKey } from "./config.js";
 import { EXT, toDtcg } from "./dtcg.js";
 import { readDump } from "./dump.js";
 import { Issues } from "./issues.js";
 const EXPORT_SCRIPT = new URL("./figma/export.js", import.meta.url);
+const SKILL = new URL("./agent/SKILL.md", import.meta.url);
+const SKILL_PATH = ".claude/skills/figma-mcp-tokens/SKILL.md";
+const AGENTS_START = "<!-- figma-mcp-tokens:start -->";
+const AGENTS_END = "<!-- figma-mcp-tokens:end -->";
 /** The code to pass to use_figma for one chunk of the export. */
 export function script(config, chunk = 1) {
     if (!Number.isInteger(chunk) || chunk < 1)
@@ -97,4 +102,47 @@ export function build(config) {
     const outputs = buildOutputs(readTokens(config), config, issues);
     const warnings = issues.settle();
     return report(writeChanged(outputs, config.root), warnings);
+}
+/**
+ * Sets a project up from its root: writes the config if there's none (from the Figma URL), the
+ * Claude Code skill that tells an agent how to sync, and a pointer to it in AGENTS.md if the
+ * project has one. Run again after upgrading to refresh the skill.
+ */
+export function init(root, configPath, figma) {
+    const files = [];
+    const messages = [];
+    const configName = relative(root, configPath).split(sep).join("/");
+    if (existsSync(configPath)) {
+        if (figma !== undefined)
+            messages.push(`${configName} already exists; left it as is.`);
+    }
+    else {
+        if (figma === undefined) {
+            throw new Error(`No ${configName} yet. Pass the Figma file URL: figma-mcp-tokens init <url>`);
+        }
+        figmaFileKey(figma);
+        files.push({ path: configPath, content: `${formatJson({ figma })}\n` });
+    }
+    const cli = `npx figma-mcp-tokens${configName === CONFIG_FILE ? "" : ` --config ${configName}`}`;
+    const skill = readFileSync(SKILL, "utf8").replaceAll("__CLI__", cli).replaceAll("__CONFIG__", configName);
+    files.push({ path: join(root, SKILL_PATH), content: skill });
+    const agentsPath = join(root, "AGENTS.md");
+    if (existsSync(agentsPath)) {
+        const block = [
+            AGENTS_START,
+            "## Design tokens",
+            "",
+            `Design tokens are synced from Figma with figma-mcp-tokens. Follow ${SKILL_PATH} to sync them;`,
+            "don't edit the generated token files by hand.",
+            AGENTS_END,
+        ].join("\n");
+        const agents = readFileSync(agentsPath, "utf8");
+        const start = agents.indexOf(AGENTS_START);
+        const end = agents.indexOf(AGENTS_END);
+        const content = start !== -1 && end > start
+            ? agents.slice(0, start) + block + agents.slice(end + AGENTS_END.length)
+            : `${agents.trimEnd()}\n\n${block}\n`;
+        files.push({ path: agentsPath, content });
+    }
+    return [...messages, ...report(writeChanged(files, root), [])];
 }

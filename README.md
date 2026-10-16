@@ -3,7 +3,8 @@
 Turns the variables and styles in a Figma file into design tokens for code: a
 [DTCG](https://www.designtokens.org/) `tokens.json`, CSS custom properties, and a typed
 JS/TS module. The export runs inside Figma through the Figma MCP server's `use_figma`
-tool; everything after that is a plain CLI with no runtime dependencies.
+tool; everything after that is a plain CLI with no runtime dependencies. `init` installs a
+Claude Code skill in the project, so an agent knows how to run the export without being told.
 
 > **v0.x:** the config and output formats may still change between minor versions.
 
@@ -47,35 +48,48 @@ truncated, copied wrongly, or left over from a different export. A design system
 The package isn't on npm. Install it from GitHub, pinned to a tag:
 
 ```sh
-pnpm add -D github:tjones-dev/figma-mcp-tokens#v0.1.0
-# or: npm i -D github:tjones-dev/figma-mcp-tokens#v0.1.0
+pnpm add -D github:tjones-dev/figma-mcp-tokens#v0.2.0
+# or: npm i -D github:tjones-dev/figma-mcp-tokens#v0.2.0
 ```
 
 The repo is private, so the machine needs GitHub access over SSH or through
 `gh auth setup-git`. Requires Node 20+.
 
-### Configure
+### Set up
 
-Create `figma-mcp-tokens.config.json` in the project root. Only `figma` is required:
+From the project root:
 
-```json
-{
-  "figma": "https://www.figma.com/design/<fileKey>/<name>"
-}
+```sh
+npx figma-mcp-tokens init https://www.figma.com/design/<fileKey>/<name>
 ```
 
-See [Configuration](#configuration) for every option.
+This writes:
+
+- **`figma-mcp-tokens.config.json`** with `{ "figma": "<url>" }`, unless a config already
+  exists. Only `figma` is required. See [Configuration](#configuration) for every option.
+- **`.claude/skills/figma-mcp-tokens/SKILL.md`**, a Claude Code skill with the export and sync
+  steps and what to do when they fail. Claude Code loads it whenever a request is about
+  syncing design tokens or Figma variables. Commit it.
+- **A "Design tokens" section in `AGENTS.md`** that points other agents (Cursor, Codex, …) at
+  the skill file. Only if the project already has an `AGENTS.md`. The section sits between
+  `<!-- figma-mcp-tokens:start -->` and `<!-- figma-mcp-tokens:end -->` markers and is
+  replaced on every run.
+
+`init` overwrites the skill and the `AGENTS.md` section, so don't edit them by hand. With
+`--config <path>`, the config goes there and the skill's commands pass the same `--config`.
 
 ### Export and sync
 
-Ask your MCP client to export the tokens. A prompt like this is enough:
+Ask your agent to sync the design tokens. With the skill installed, "sync the tokens from
+Figma" is enough. Without it (an agent that reads neither `.claude/skills` nor `AGENTS.md`),
+spell it out:
 
 > Run `npx figma-mcp-tokens script` and pass its output to the Figma MCP `use_figma` tool
 > for the file in figma-mcp-tokens.config.json. Save the result exactly as returned to the
 > path in its `saveAs`. Its `next` field says whether to export another chunk or run
 > `npx figma-mcp-tokens sync`.
 
-Step by step:
+What the agent does, step by step:
 
 ```sh
 npx figma-mcp-tokens script            # export code for chunk 1
@@ -114,6 +128,7 @@ const darkPage = tokens.$modes.dark.color.surface.page;
 
 | Command | What it does |
 | --- | --- |
+| `figma-mcp-tokens init [<figma url>]` | Writes the config if there's none, the agent skill, and the `AGENTS.md` section. |
 | `figma-mcp-tokens script [--chunk <n>]` | Prints the export code for `use_figma`. |
 | `figma-mcp-tokens sync` | Reads the dump, writes `tokens.json` and every output. Writes nothing when unchanged. |
 | `figma-mcp-tokens build` | Writes every output from `tokens.json`. Doesn't read the dump. |
@@ -267,10 +282,11 @@ These fail with `strict: true`, and are skipped with a warning with `strict: fal
 
 ```
 src/
-  cli.ts             argument parsing and the three commands' output
-  commands.ts        script, sync and build; JSON formatting; writing only what changed
+  cli.ts             argument parsing and the commands' output
+  commands.ts        init, script, sync and build; JSON formatting; writing only what changed
   config.ts          loads and checks figma-mcp-tokens.config.json
   figma/export.js    the script that runs inside Figma (plain JS, no imports)
+  agent/SKILL.md     the skill `init` installs; __CLI__ and __CONFIG__ are filled in
   dump.ts            reads the chunks, checks their checksums, joins them
   dtcg.ts            dump → DTCG tokens (units, modes, text and effect styles)
   build.ts           tokens.json → CSS and module (resolving references and modes)
@@ -288,6 +304,9 @@ dist/                compiled output: committed, see below
 Figma's plugin sandbox: plain JS, top-level `await`, no imports, and it ends in a `return`.
 The tests run it against `test/fake-figma.ts`. When you change it in ways the fake can't
 check, also run it once against a real file through `use_figma`.
+
+`src/agent/SKILL.md` is also copied into `dist/` as is. It's what an agent follows, so when
+a change affects the steps, an error message the skill quotes, or a command, update it too.
 
 ### Setup
 
@@ -340,7 +359,8 @@ git push && git push --tags
 ### Updating a project to a new version
 
 ```sh
-pnpm add -D github:tjones-dev/figma-mcp-tokens#v0.2.0
+pnpm add -D github:tjones-dev/figma-mcp-tokens#v0.3.0
+npx figma-mcp-tokens init     # refresh the skill and the AGENTS.md section
 npx figma-mcp-tokens build    # regenerate outputs with the new version
 ```
 

@@ -1,8 +1,9 @@
-import { readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { build, sync } from "../src/commands.js";
-import { figmaFileKey } from "../src/config.js";
+import { build, init, sync } from "../src/commands.js";
+import { figmaFileKey, loadConfig } from "../src/config.js";
 import { alias, exportAll, runExport, type FakeFile } from "./fake-figma.js";
 import { project, sampleFile } from "./sample.js";
 
@@ -250,5 +251,57 @@ describe("build", () => {
     tokens.component.card.radius.$value = "{primitive.scale.99}";
     writeFileSync(path, JSON.stringify(tokens));
     expect(() => build(config)).toThrow(/\{primitive.scale.99\} points at no token/);
+  });
+});
+
+describe("init", () => {
+  const URL = "https://www.figma.com/design/AbC123/Name";
+  const SKILL = ".claude/skills/figma-mcp-tokens/SKILL.md";
+
+  it("writes the config and the skill, and nothing more when run again", () => {
+    const root = mkdtempSync(join(tmpdir(), "figma-mcp-tokens-init-"));
+    const config = join(root, "figma-mcp-tokens.config.json");
+    expect(() => init(root, config)).toThrow(/Pass the Figma file URL/);
+    expect(() => init(root, config, "https://example.com")).toThrow(/Figma design URL/);
+
+    expect(init(root, config, URL)).toEqual(["Wrote figma-mcp-tokens.config.json", `Wrote ${SKILL}`]);
+    expect(loadConfig(config).fileKey).toBe("AbC123");
+    const skill = readFileSync(join(root, SKILL), "utf8");
+    expect(skill).toMatch(/^---\nname: figma-mcp-tokens\ndescription: /);
+    expect(skill).toContain("Run `npx figma-mcp-tokens script`.");
+    expect(skill).not.toMatch(/__CLI__|__CONFIG__/);
+    expect(existsSync(join(root, "AGENTS.md"))).toBe(false);
+
+    expect(init(root, config)).toEqual(["No changes."]);
+    expect(init(root, config, "https://www.figma.com/design/Other/Name")).toEqual([
+      "figma-mcp-tokens.config.json already exists; left it as is.",
+      "No changes.",
+    ]);
+    rmSync(root, { recursive: true });
+  });
+
+  it("names a config outside the default in the skill's commands", () => {
+    const root = mkdtempSync(join(tmpdir(), "figma-mcp-tokens-init-"));
+    init(root, join(root, "design/tokens.config.json"), URL);
+    const skill = readFileSync(join(root, SKILL), "utf8");
+    expect(skill).toContain("Run `npx figma-mcp-tokens --config design/tokens.config.json script`.");
+    expect(skill).toContain("named in\n`design/tokens.config.json`.");
+    rmSync(root, { recursive: true });
+  });
+
+  it("adds a pointer to an existing AGENTS.md, and replaces it on the next run", () => {
+    const root = mkdtempSync(join(tmpdir(), "figma-mcp-tokens-init-"));
+    const agents = join(root, "AGENTS.md");
+    writeFileSync(agents, "# Agents\n\nUse pnpm.\n");
+    init(root, join(root, "figma-mcp-tokens.config.json"), URL);
+    const first = readFileSync(agents, "utf8");
+    expect(first).toMatch(/^# Agents\n\nUse pnpm\.\n\n<!-- figma-mcp-tokens:start -->\n## Design tokens\n/);
+    expect(first).toContain(`Follow ${SKILL} to sync them;`);
+    expect(first).toMatch(/<!-- figma-mcp-tokens:end -->\n$/);
+
+    writeFileSync(agents, first.replace("## Design tokens", "## Old") + "\nMore notes.\n");
+    expect(init(root, join(root, "figma-mcp-tokens.config.json"))).toEqual(["Wrote AGENTS.md"]);
+    expect(readFileSync(agents, "utf8")).toBe(first + "\nMore notes.\n");
+    rmSync(root, { recursive: true });
   });
 });

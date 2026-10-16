@@ -1,6 +1,6 @@
 {
   "name": "figma-mcp-tokens",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Design tokens from Figma variables and styles, exported through the Figma MCP server.",
   "license": "UNLICENSED",
   "private": true,

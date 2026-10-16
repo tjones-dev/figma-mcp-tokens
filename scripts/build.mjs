@@ -1,4 +1,4 @@
-// Compiles src/ into dist/ and copies the Figma export script next to it.
+// Compiles src/ into dist/ and copies the Figma export script and the agent skill next to it.
 // With --check, builds into a temporary folder instead and fails if dist/ differs.
 import { execFileSync } from "node:child_process";
 import { chmodSync, cpSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
@@ -17,6 +17,7 @@ execFileSync(
   { stdio: "inherit" },
 );
 cpSync(join(root, "src/figma/export.js"), join(out, "figma/export.js"));
+cpSync(join(root, "src/agent/SKILL.md"), join(out, "agent/SKILL.md"));
 chmodSync(join(out, "cli.js"), 0o755);
 
 if (check) {
