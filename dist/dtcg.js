@@ -55,60 +55,103 @@ function numberValue(n, unit) {
     return n;
 }
 const ALIAS = /^\{([^:?][^:]*):(.+)\}$/;
-/** "{collection:a/b}" → "{collection.a.b}" */
-function reference(alias) {
-    const [, collection = "", name = ""] = ALIAS.exec(alias) ?? [];
-    return `{${[tokenKey(collection), ...tokenPath(name)].join(".")}}`;
+function mergedNames(config) {
+    return new Map(Object.entries(config.merge).flatMap(([name, tiers]) => tiers.map((tier) => [tier, name])));
 }
-/** Places a token in a nested group by its path. */
+/** "{collection:a/b}" → "{collection.a.b}", with a tier collection replaced by its merged collection. */
+function reference(alias, merged) {
+    const [, collection = "", name = ""] = ALIAS.exec(alias) ?? [];
+    return `{${[tokenKey(merged.get(collection) ?? collection), ...tokenPath(name)].join(".")}}`;
+}
+/** Places a token in a nested group by its path; false if it can't, after reporting why. */
 function place(root, path, token, where, issues) {
     let group = root;
     for (const key of path.slice(0, -1)) {
         const next = (group[key] ??= {});
         if ("$value" in next) {
             issues.add(`${where}: ${path.join("/")} is inside the token ${key}; rename one of them.`);
-            return;
+            return false;
         }
         group = next;
     }
     const last = path.at(-1) ?? "";
     if (last in group) {
         issues.add(`${where}: the name ${path.join("/")} is used twice; rename one of them.`);
-        return;
+        return false;
     }
     group[last] = token;
+    return true;
 }
-function variables(dump, config, issues) {
-    const tokens = {};
-    const units = new Map();
-    for (const [collection, { variables }] of Object.entries(dump.collections)) {
-        for (const variable of variables) {
-            if (variable[1] === "n")
-                units.set(`${collection}:${variable[0]}`, numberUnit(collection, variable, config));
+/** What a number variable is in each unit, for reporting a mismatch between tiers. */
+const KINDS = {
+    px: "a dimension",
+    ms: "a duration",
+    none: "a number",
+    opacity: "an opacity",
+};
+/**
+ * Problems that would drop or mix whole tiers fail the sync even without `strict`: a tier
+ * collection that isn't in the dump, a merge named like another collection, and a mode that's
+ * in two tiers of one merge.
+ */
+function checkMerges(dump, config) {
+    for (const [name, tiers] of Object.entries(config.merge)) {
+        const fail = (message) => {
+            throw new Error(`Merge ${name}: ${message}`);
+        };
+        for (const tier of tiers) {
+            if (!dump.collections[tier])
+                fail(`no collection named ${tier} in the Figma file.`);
+        }
+        if (Object.keys(dump.collections).some((c) => !tiers.includes(c) && tokenKey(c) === tokenKey(name))) {
+            fail("the name is taken by a collection in the Figma file; pick another merge name.");
+        }
+        const owners = new Map();
+        for (const tier of tiers) {
+            for (const mode of dump.collections[tier]?.modes ?? []) {
+                const owner = owners.get(mode);
+                if (owner !== undefined)
+                    fail(`mode ${mode} is in both ${owner} and ${tier}; rename one.`);
+                owners.set(mode, tier);
+            }
         }
     }
-    for (const [collection, { modes, variables }] of Object.entries(dump.collections)) {
-        const key = tokenKey(collection);
-        if (STYLE_GROUPS.includes(key) || key in tokens) {
-            issues.add(`Collection ${collection}: the name is taken; rename the collection.`);
-            continue;
+}
+function variables(dump, config, issues) {
+    const merged = mergedNames(config);
+    // A tier's units are worked out with the merged collection's name, and a merged variable
+    // takes the unit of the first tier that has it, for every tier's values.
+    const units = new Map();
+    for (const [collection, { variables }] of Object.entries(dump.collections)) {
+        const named = merged.get(collection) ?? collection;
+        for (const variable of variables) {
+            if (variable[1] === "n")
+                units.set(`${collection}:${variable[0]}`, numberUnit(named, variable, config));
         }
+    }
+    const unitOf = (collection, name) => {
+        const mergeName = merged.get(collection);
+        const tiers = (mergeName === undefined ? undefined : config.merge[mergeName]) ?? [collection];
+        const owner = tiers.find((tier) => units.has(`${tier}:${name}`)) ?? collection;
+        return units.get(`${owner}:${name}`);
+    };
+    const collectionGroup = (collection, { modes, variables }, placed) => {
         const group = { $extensions: { [EXT]: { modes } } };
         for (const variable of variables) {
             const [name, type, web, , ...values] = variable;
             const where = `${collection}/${name}`;
-            const unit = units.get(`${collection}:${name}`);
+            const unit = unitOf(collection, name);
             const value = (v) => {
                 if (typeof v === "string" && v.startsWith("{?")) {
                     throw `aliases ${v.slice(2, -1)} from a library; library variables aren't supported yet.`;
                 }
                 if (typeof v === "string" && ALIAS.test(v)) {
                     const [, targetCollection = "", targetName = ""] = ALIAS.exec(v) ?? [];
-                    const targetUnit = units.get(`${targetCollection}:${targetName}`);
+                    const targetUnit = unitOf(targetCollection, targetName);
                     if (unit && targetUnit && (unit === "opacity") !== (targetUnit === "opacity")) {
                         throw `aliases ${targetCollection}/${targetName}, but only one of them is an opacity (0–100 in Figma). Scope both as opacity or neither.`;
                     }
-                    return reference(v);
+                    return reference(v, merged);
                 }
                 if (type === "n") {
                     if (typeof v !== "number")
@@ -128,32 +171,113 @@ function variables(dump, config, issues) {
             }
             let token;
             try {
-                const [first, ...rest] = values.map(value);
-                const other = {};
-                rest.forEach((v, i) => {
-                    if (v !== first)
-                        other[modes[i + 1] ?? ""] = v;
-                });
-                const extensions = {};
-                if (web)
-                    extensions["com.figma"] = { codeSyntax: { WEB: web } };
-                if (Object.keys(other).length > 0)
-                    extensions[EXT] = { modes: other };
-                token = {
-                    $type: type === "n" ? NUMBER_TYPES[unit ?? "px"] : TYPES[type],
-                    $value: first,
-                    ...(Object.keys(extensions).length > 0 ? { $extensions: extensions } : {}),
-                };
+                token = modeToken(type === "n" ? NUMBER_TYPES[unit ?? "px"] : TYPES[type], web, modes, values.map(value));
             }
             catch (message) {
                 issues.add(`${where} ${message}`);
                 continue;
             }
-            place(group, tokenPath(name), token, `Variable ${collection}`, issues);
+            if (place(group, tokenPath(name), token, `Variable ${collection}`, issues))
+                placed?.set(name, token);
         }
-        tokens[key] = group;
+        return group;
+    };
+    /** "a color", "a duration", "an opacity", …: what a variable is in one tier, unit included. */
+    const kind = (tier, [name, type]) => {
+        if (type === "n")
+            return KINDS[units.get(`${tier}:${name}`) ?? "px"];
+        return type in TYPES ? `a ${TYPES[type]}` : `a ${type}`;
+    };
+    /**
+     * One group for a merge: each tier is converted on its own (so problems name the tier), then
+     * each token takes its value in every mode from the tier that owns the mode. A variable that
+     * isn't in every tier, or isn't the same type and unit in every tier, is reported and left
+     * out; one whose WEB code syntax differs is reported and keeps the first tier's.
+     */
+    const mergedGroup = (name, tiers) => {
+        const present = tiers.map((tier) => {
+            const collection = dump.collections[tier];
+            const placed = new Map();
+            collectionGroup(tier, collection, placed);
+            return { tier, modes: collection.modes, dumped: new Map(collection.variables.map((v) => [v[0], v])), placed };
+        });
+        const modes = present.flatMap((tier) => tier.modes);
+        const group = { $extensions: { [EXT]: { modes, merged: tiers } } };
+        const names = new Set(present.flatMap(({ dumped }) => [...dumped.keys()]));
+        for (const variable of names) {
+            const problem = (message) => issues.add(`Merge ${name}: ${variable} ${message}`);
+            const owner = present.find(({ dumped }) => dumped.has(variable));
+            const missing = present.filter(({ dumped }) => !dumped.has(variable));
+            for (const { tier } of missing)
+                problem(`is in ${owner?.tier} but not ${tier}.`);
+            if (!owner || missing.length > 0)
+                continue;
+            const ownerVariable = owner.dumped.get(variable);
+            let consistent = true;
+            for (const { tier, dumped } of present.slice(1)) {
+                const tierVariable = dumped.get(variable);
+                const [first, other] = [kind(owner.tier, ownerVariable), kind(tier, tierVariable)];
+                if (first !== other) {
+                    problem(`is ${first} in ${owner.tier} but ${other} in ${tier}.`);
+                    consistent = false;
+                }
+                const [firstWeb, otherWeb] = [ownerVariable[2] ?? "none", tierVariable[2] ?? "none"];
+                if (firstWeb !== otherWeb)
+                    problem(`has WEB code syntax ${firstWeb} in ${owner.tier} but ${otherWeb} in ${tier}.`);
+            }
+            // A tier that couldn't convert the variable has already reported why.
+            const parts = present.map(({ placed }) => placed.get(variable));
+            if (!consistent || parts.some((part) => part === undefined))
+                continue;
+            const values = present.flatMap(({ modes }, i) => {
+                const part = parts[i];
+                const other = (part.$extensions?.[EXT]?.["modes"] ?? {});
+                return modes.map((mode, m) => (m > 0 && mode in other ? other[mode] : part.$value));
+            });
+            const first = parts[0];
+            place(group, tokenPath(variable), modeToken(first.$type, ownerVariable[2], modes, values), `Variable ${name}`, issues);
+        }
+        return group;
+    };
+    checkMerges(dump, config);
+    const tokens = {};
+    const done = new Set();
+    for (const [collection, dumped] of Object.entries(dump.collections)) {
+        // A merged group takes the place of its first tier in the file.
+        const mergeName = merged.get(collection);
+        if (mergeName !== undefined) {
+            if (done.has(mergeName))
+                continue;
+            done.add(mergeName);
+        }
+        const name = mergeName ?? collection;
+        const key = tokenKey(name);
+        if (STYLE_GROUPS.includes(key) || key in tokens) {
+            issues.add(`Collection ${name}: the name is taken; rename the collection.`);
+            continue;
+        }
+        tokens[key] = mergeName ? mergedGroup(mergeName, config.merge[mergeName] ?? []) : collectionGroup(collection, dumped);
     }
     return tokens;
+}
+/** A token whose $value is the first mode's value; the other modes are kept where they differ. */
+function modeToken(type, web, modes, values) {
+    const [first, ...rest] = values;
+    const other = {};
+    rest.forEach((v, i) => {
+        if (v !== first)
+            other[modes[i + 1] ?? ""] = v;
+    });
+    const extensions = {};
+    if (web)
+        extensions["com.figma"] = { codeSyntax: { WEB: web } };
+    if (Object.keys(other).length > 0)
+        extensions[EXT] = { modes: other };
+    return {
+        $type: type,
+        $value: first,
+        ...(Object.keys(extensions).length > 0 ? { $extensions: extensions } : {}),
+    };
 }
 const WEIGHTS = {
     thin: 100,
@@ -194,11 +318,11 @@ const TEXT_DECORATION = {
     STRIKETHROUGH: "line-through",
 };
 /** A bound variable's reference, or the literal value for an unbound or library field. */
-function boundOr(bound, field, literal) {
+function boundOr(bound, field, literal, merged) {
     const alias = bound?.[field];
-    return alias && ALIAS.test(alias) ? reference(alias) : literal;
+    return alias && ALIAS.test(alias) ? reference(alias, merged) : literal;
 }
-function textStyle(style) {
+function textStyle(style, merged) {
     const [, family, styleName, size, height, spacing, textCase, decoration, bound] = style;
     const font = fontStyle(styleName);
     if (!font)
@@ -226,18 +350,18 @@ function textStyle(style) {
     return {
         $type: "typography",
         $value: {
-            fontFamily: boundOr(bound, "fontFamily", family),
-            fontWeight: boundOr(bound, "fontWeight", font.weight),
+            fontFamily: boundOr(bound, "fontFamily", family, merged),
+            fontWeight: boundOr(bound, "fontWeight", font.weight, merged),
             fontStyle: font.italic ? "italic" : "normal",
-            fontSize: boundOr(bound, "fontSize", `${size}px`),
-            lineHeight: boundOr(bound, "lineHeight", lineHeight),
-            letterSpacing: boundOr(bound, "letterSpacing", letterSpacing),
+            fontSize: boundOr(bound, "fontSize", `${size}px`, merged),
+            lineHeight: boundOr(bound, "lineHeight", lineHeight, merged),
+            letterSpacing: boundOr(bound, "letterSpacing", letterSpacing, merged),
             textTransform,
             textDecoration,
         },
     };
 }
-function effectStyle([name, effects], issues) {
+function effectStyle([name, effects], merged, issues) {
     const shadows = effects.flatMap(([type, color, x, y, blur, spread, visible, bound]) => {
         if (type !== "DROP_SHADOW" && type !== "INNER_SHADOW") {
             issues.add(`Effect style ${name}: ${type} effects aren't supported; only shadows are.`);
@@ -247,11 +371,11 @@ function effectStyle([name, effects], issues) {
             return [];
         return [
             {
-                color: boundOr(bound, "color", color),
-                offsetX: boundOr(bound, "offsetX", `${x}px`),
-                offsetY: boundOr(bound, "offsetY", `${y}px`),
-                blur: boundOr(bound, "radius", `${blur}px`),
-                spread: boundOr(bound, "spread", `${spread}px`),
+                color: boundOr(bound, "color", color, merged),
+                offsetX: boundOr(bound, "offsetX", `${x}px`, merged),
+                offsetY: boundOr(bound, "offsetY", `${y}px`, merged),
+                blur: boundOr(bound, "radius", `${blur}px`, merged),
+                spread: boundOr(bound, "spread", `${spread}px`, merged),
                 ...(type === "INNER_SHADOW" ? { inset: true } : {}),
             },
         ];
@@ -262,10 +386,11 @@ function effectStyle([name, effects], issues) {
 /** The DTCG tokens for a dump. */
 export function toDtcg(dump, config, issues) {
     const tokens = variables(dump, config, issues);
+    const merged = mergedNames(config);
     const text = {};
     for (const style of dump.textStyles) {
         try {
-            place(text, tokenPath(style[0]), textStyle(style), "Text style", issues);
+            place(text, tokenPath(style[0]), textStyle(style, merged), "Text style", issues);
         }
         catch (message) {
             issues.add(`Text style ${style[0]}: ${message}`);
@@ -275,7 +400,7 @@ export function toDtcg(dump, config, issues) {
         tokens["text"] = text;
     const effect = {};
     for (const style of dump.effectStyles) {
-        const token = effectStyle(style, issues);
+        const token = effectStyle(style, merged, issues);
         if (token)
             place(effect, tokenPath(style[0]), token, "Effect style", issues);
     }

@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, relative, sep } from "node:path";
 import { buildOutputs } from "./build.js";
 import { CONFIG_FILE, figmaFileKey } from "./config.js";
-import { EXT, toDtcg } from "./dtcg.js";
+import { EXT, toDtcg, tokenKey } from "./dtcg.js";
 import { readDump } from "./dump.js";
 import { Issues } from "./issues.js";
 const EXPORT_SCRIPT = new URL("./figma/export.js", import.meta.url);
@@ -91,16 +91,54 @@ export function sync(config) {
         },
         ...toDtcg(dump, config, issues),
     };
-    const outputs = buildOutputs(tokens, config, issues);
+    let outputs;
+    try {
+        outputs = buildOutputs(tokens, config, issues);
+    }
+    catch (error) {
+        // A token left out for a problem breaks the aliases to it; with strict, report the problem.
+        issues.settle();
+        throw error;
+    }
     const warnings = issues.settle();
     const written = writeChanged([{ path: config.tokens, content: `${formatJson(tokens)}\n` }, ...outputs], config.root);
     return report(written, warnings);
 }
-/** tokens.json → every output; writes only what changed. */
+/**
+ * The merges that differ between the config and the merged groups in tokens.json: a key on one
+ * side only, or a key whose tiers differ. Config keys come first, in config order.
+ */
+function mergeMismatches(config, tokens) {
+    const synced = new Map();
+    for (const [key, group] of Object.entries(tokens)) {
+        const record = group?.["$extensions"];
+        const tiers = record?.[EXT]?.["merged"];
+        if (Array.isArray(tiers))
+            synced.set(key, tiers);
+    }
+    const mismatched = [];
+    for (const [name, tiers] of Object.entries(config.merge)) {
+        const key = tokenKey(name);
+        const syncedTiers = synced.get(key);
+        synced.delete(key);
+        if (syncedTiers === undefined || syncedTiers.join("\n") !== tiers.join("\n"))
+            mismatched.push(name);
+    }
+    return [...mismatched, ...synced.keys()];
+}
+/**
+ * tokens.json → every output; writes only what changed. Warns, without failing, when the config's
+ * merge doesn't match tokens.json: build doesn't merge, so a changed merge needs a fresh sync.
+ */
 export function build(config) {
+    const tokens = readTokens(config);
     const issues = new Issues(config.strict);
-    const outputs = buildOutputs(readTokens(config), config, issues);
-    const warnings = issues.settle();
+    const outputs = buildOutputs(tokens, config, issues);
+    const warnings = [...issues.settle()];
+    const mismatched = mergeMismatches(config, tokens);
+    if (mismatched.length > 0) {
+        warnings.push(`merge in the config doesn't match tokens.json (${mismatched.join(", ")}); export from Figma and run figma-mcp-tokens sync.`);
+    }
     return report(writeChanged(outputs, config.root), warnings);
 }
 /**

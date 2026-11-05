@@ -1,6 +1,7 @@
 // Loads figma-mcp-tokens.config.json. Every path in it is relative to the config file.
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
+import { STYLE_GROUPS, tokenKey } from "./dtcg.js";
 
 export const CONFIG_FILE = "figma-mcp-tokens.config.json";
 
@@ -18,6 +19,8 @@ export type Config = {
   primitives: string[];
   css: { prefix: string; selector: string; modeSelector: string };
   units: Record<string, Unit>;
+  /** Merged collection name → the tier collections it replaces, in order. */
+  merge: Record<string, string[]>;
   strict: boolean;
 };
 
@@ -28,6 +31,7 @@ const DEFAULTS = {
   primitives: ["primitive"],
   css: { prefix: "", selector: ":root", modeSelector: '[data-theme="{mode}"]' },
   units: {},
+  merge: {},
   strict: true,
 };
 
@@ -61,6 +65,23 @@ function object(value: unknown, name: string): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 
+/** `merge`: each key names a list of tier collections, and no collection is listed twice. */
+function mergeOption(value: unknown): Record<string, string[]> {
+  const merge = object(value, "merge");
+  const listed = new Set<string>();
+  for (const [name, tiers] of Object.entries(merge)) {
+    if (!Array.isArray(tiers) || tiers.length === 0 || !tiers.every((t) => typeof t === "string" && t !== "")) {
+      fail(`merge.${name} must be a list of collection names.`);
+    }
+    if (STYLE_GROUPS.includes(tokenKey(name))) fail(`merge.${name} is a reserved name; pick another.`);
+    for (const tier of tiers as string[]) {
+      if (listed.has(tier)) fail(`${tier} is listed in merge more than once.`);
+      listed.add(tier);
+    }
+  }
+  return merge as Record<string, string[]>;
+}
+
 /** Reads and checks the config; a missing option takes its default. */
 export function loadConfig(path = resolve(CONFIG_FILE)): Config {
   if (!existsSync(path)) {
@@ -87,6 +108,7 @@ export function loadConfig(path = resolve(CONFIG_FILE)): Config {
   if (!Array.isArray(primitives) || !primitives.every((p) => typeof p === "string")) {
     fail("primitives must be a list of collection names.");
   }
+  const merge = mergeOption(config["merge"] ?? DEFAULTS.merge);
   const strict = config["strict"] ?? DEFAULTS.strict;
   if (typeof strict !== "boolean") fail("strict must be true or false.");
 
@@ -116,6 +138,7 @@ export function loadConfig(path = resolve(CONFIG_FILE)): Config {
     primitives,
     css: { prefix, selector: string(cssOption("selector"), "css.selector"), modeSelector },
     units: units as Record<string, Unit>,
+    merge,
     strict,
   };
 }

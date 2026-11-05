@@ -5,7 +5,7 @@ import { describe, expect, it } from "vitest";
 import { build, init, sync } from "../src/commands.js";
 import { figmaFileKey, loadConfig } from "../src/config.js";
 import { alias, exportAll, runExport, type FakeFile } from "./fake-figma.js";
-import { project, sampleFile } from "./sample.js";
+import { project, sampleFile, TIERED, tieredFile } from "./sample.js";
 
 async function synced(file: FakeFile = sampleFile(), options: Record<string, unknown> = {}) {
   const { root, config } = project(options);
@@ -26,6 +26,39 @@ describe("config", () => {
   it("refuses unknown options", () => {
     expect(() => project({ output: {} })).toThrow(/unknown option output/);
     expect(() => project({ css: { selectr: ":root" } })).toThrow(/unknown option css.selectr/);
+  });
+
+  it("merges nothing by default", () => {
+    expect(project().config.merge).toEqual({});
+    expect(project(TIERED).config.merge).toEqual(TIERED.merge);
+  });
+
+  it("refuses a wrongly shaped merge", () => {
+    const error = (merge: unknown) => () => project({ merge });
+    expect(error([])).toThrow("figma-mcp-tokens.config.json: merge must be an object.");
+    const list = "figma-mcp-tokens.config.json: merge.Element must be a list of collection names.";
+    expect(error({ Element: "Element T1" })).toThrow(list);
+    expect(error({ Element: [] })).toThrow(list);
+    expect(error({ Element: ["Element T1", ""] })).toThrow(list);
+    expect(error({ Element: ["Element T1", 2] })).toThrow(list);
+    expect(error({ Element: ["Element T1"], Crop: null })).toThrow(
+      "figma-mcp-tokens.config.json: merge.Crop must be a list of collection names.",
+    );
+  });
+
+  it("refuses a collection listed in merge more than once", () => {
+    const twice = "figma-mcp-tokens.config.json: Element T2 is listed in merge more than once.";
+    expect(() => project({ merge: { Element: ["Element T1", "Element T2", "Element T2"] } })).toThrow(twice);
+    expect(() => project({ merge: { Element: ["Element T1", "Element T2"], Crop: ["Element T2"] } })).toThrow(twice);
+  });
+
+  it("refuses a merge named like a style group", () => {
+    expect(() => project({ merge: { text: ["Text T1", "Text T2"] } })).toThrow(
+      "figma-mcp-tokens.config.json: merge.text is a reserved name; pick another.",
+    );
+    expect(() => project({ merge: { effect: ["Effect T1"] } })).toThrow(
+      "figma-mcp-tokens.config.json: merge.effect is a reserved name; pick another.",
+    );
   });
 });
 
@@ -237,6 +270,271 @@ describe("strictness", () => {
   });
 });
 
+describe("merge", () => {
+  const moduleTokens = (ts: string) => JSON.parse(ts.slice(ts.indexOf("{"), ts.lastIndexOf("}") + 1));
+
+  it("can't export tier collections without merging them", async () => {
+    await expect(synced(tieredFile(), { primitives: TIERED.primitives })).rejects.toThrow(
+      /--element-lo is also Element T1.element.lo's/,
+    );
+  });
+
+  it("writes one group for the tiers, with every tier's modes and the first as default", async () => {
+    const { json } = await synced(tieredFile(), TIERED);
+    const tokens = json();
+    expect(tokens["Element T1"]).toBeUndefined();
+    expect(tokens["Element T2"]).toBeUndefined();
+    expect(tokens.Element).toEqual({
+      $extensions: {
+        "figma-mcp-tokens": { modes: ["fire", "water", "electric", "strength"], merged: ["Element T1", "Element T2"] },
+      },
+      element: {
+        lo: {
+          $type: "color",
+          $value: "#ff4400",
+          $extensions: {
+            "com.figma": { codeSyntax: { WEB: "var(--element-lo)" } },
+            "figma-mcp-tokens": { modes: { water: "#0066ff", electric: "#ffee00", strength: "#8b0000" } },
+          },
+        },
+        hi: { $type: "color", $value: "#ffaa00", $extensions: { "figma-mcp-tokens": { modes: { strength: "#ffffff" } } } },
+        accent: { $type: "color", $value: "{Element.element.hi}" },
+        duration: {
+          pulse: {
+            $type: "duration",
+            $value: "200ms",
+            $extensions: { "figma-mcp-tokens": { modes: { water: "300ms", electric: "100ms", strength: "400ms" } } },
+          },
+        },
+        opacity: {
+          glow: { $type: "number", $value: 0.8, $extensions: { "figma-mcp-tokens": { modes: { water: 0.6, strength: 0.9 } } } },
+        },
+        size: { $type: "dimension", $value: "12px", $extensions: { "figma-mcp-tokens": { modes: { electric: "16px" } } } },
+      },
+    });
+  });
+
+  it("rewrites aliases into the tiers to the merged group", async () => {
+    const { json } = await synced(tieredFile(), TIERED);
+    const tokens = json();
+    expect(tokens.Router.element.lo).toEqual({ $type: "color", $value: "{Element.element.lo}" });
+    expect(tokens.Router.element.size).toEqual({ $type: "dimension", $value: "{Element.element.size}" });
+    expect(tokens.component.badge.fill).toEqual({ $type: "color", $value: "{Router.element.lo}" });
+    expect(tokens.text.element.label.$value.fontSize).toBe("{Element.element.size}");
+    expect(tokens.effect.shadow.element.$value[0].color).toBe("{Element.element.hi}");
+  });
+
+  it("writes one CSS property and module key per variable, with every other mode as a theme", async () => {
+    const { read } = await synced(tieredFile(), TIERED);
+    const css = read("tokens/tokens.css");
+    expect(css.match(/--element-lo:/g)).toHaveLength(4);
+    expect(css).toContain(":root {\n  --color-surface-page: #fffbf2;");
+    const root = css.slice(css.indexOf(":root"), css.indexOf("}"));
+    expect(root).toContain("--element-lo: #ff4400;");
+    expect(root).toContain("--element-duration-pulse: 200ms;");
+    expect(root).toContain("--badge-fill: #ff4400;");
+    expect(root).toContain("--text-element-label: 700 12px/normal Inter;");
+    const electric = css.slice(css.indexOf('[data-theme="electric"]'));
+    expect(electric.slice(0, electric.indexOf("}") + 1)).toBe(
+      [
+        '[data-theme="electric"] {',
+        "  --badge-fill: #ffee00;",
+        "  --badge-size: 16px;",
+        "  --element-lo: #ffee00;",
+        "  --element-duration-pulse: 100ms;",
+        "  --element-size: 16px;",
+        "  --text-element-label: 700 16px/normal Inter;",
+        "}",
+      ].join("\n"),
+    );
+    expect(css).toContain('[data-theme="water"]');
+    expect(css).toMatch(/\[data-theme="strength"\] \{[^}]*--element-lo: #8b0000;/);
+    expect(css).not.toMatch(/router|-t1|-t2|"t1"|"t2"/i);
+
+    const tokens = moduleTokens(read("tokens/tokens.ts"));
+    expect(tokens.element.lo).toBe("#ff4400");
+    expect(tokens.element.duration.pulse).toBe(200);
+    expect(tokens.badge).toEqual({ fill: "#ff4400", size: 12 });
+    expect(tokens.$modes.electric.element.lo).toBe("#ffee00");
+    expect(tokens.$modes.electric.badge).toEqual({ fill: "#ffee00", size: 16 });
+    expect(tokens.$modes.strength.badge).toEqual({ fill: "#8b0000" });
+    expect(Object.keys(tokens.$modes)).toEqual(["dark", "water", "electric", "strength"]);
+  });
+
+  it("matches units globs against the merged name, not the tier names", async () => {
+    const merged = await synced(tieredFile(), { ...TIERED, units: { "Element/element/size": "none" } });
+    expect(merged.json().Element.element.size).toEqual({
+      $type: "number",
+      $value: 12,
+      $extensions: { "figma-mcp-tokens": { modes: { electric: 16 } } },
+    });
+    const tier = await synced(tieredFile(), { ...TIERED, units: { "Element T1/element/size": "none" } });
+    expect(tier.json().Element.element.size.$value).toBe("12px");
+  });
+
+  it("checks an opacity alias against the merged token's unit", async () => {
+    const file = tieredFile();
+    file.collections[2]!.variables.push({
+      name: "badge/alpha",
+      type: "FLOAT",
+      scopes: ["OPACITY"],
+      values: [alias("Element T2/element/opacity/glow")],
+    });
+    const { json } = await synced(file, TIERED);
+    expect(json().component.badge.alpha).toEqual({ $type: "number", $value: "{Element.element.opacity.glow}" });
+    await expect(synced(file, { ...TIERED, units: { "Element T2/element/opacity/*": "none" } })).resolves.toBeTruthy();
+    await expect(synced(file, { ...TIERED, units: { "Element/element/opacity/*": "none" } })).rejects.toThrow(
+      /component\/badge\/alpha aliases Element T2\/element\/opacity\/glow, but only one of them is an opacity/,
+    );
+  });
+
+  it("keeps the router in tokens.json but out of the outputs when it's a primitive", async () => {
+    const { json, read } = await synced(tieredFile(), TIERED);
+    expect(json().Router.$extensions["figma-mcp-tokens"].modes).toEqual(["T1", "T2"]);
+    expect(read("tokens/tokens.css")).not.toMatch(/router/i);
+    expect(moduleTokens(read("tokens/tokens.ts")).$modes.T1).toBeUndefined();
+  });
+});
+
+describe("merge problems", () => {
+  const T1 = 3;
+  const T2 = 4;
+  /** The tiered file with `change` applied to the variable `name` in tier collection `tier`. */
+  const changed = (tier: number, name: string, change: (v: FakeFile["collections"][number]["variables"][number]) => void) => {
+    const file = tieredFile();
+    change(file.collections[tier]!.variables.find((v) => v.name === name)!);
+    return file;
+  };
+  const without = (file: FakeFile, tier: number, name: string) => {
+    const variables = file.collections[tier]!.variables;
+    variables.splice(variables.findIndex((v) => v.name === name), 1);
+    return file;
+  };
+  const warnings = (messages: string[]) => messages.filter((m) => m.startsWith("Warning:"));
+  const LAX = { ...TIERED, strict: false };
+
+  it("reports a variable missing from some tiers, and leaves it out without strict", async () => {
+    const file = without(tieredFile(), T2, "element/duration/pulse");
+    file.collections[T2]!.variables.push({ name: "element/extra", type: "COLOR", values: ["#000000", "#ffffff"] });
+    await expect(synced(file, TIERED)).rejects.toThrow(
+      /2 problems:\n {2}- Merge Element: element\/duration\/pulse is in Element T1 but not Element T2\.\n {2}- Merge Element: element\/extra is in Element T2 but not Element T1\.\n/,
+    );
+    const { messages, json } = await synced(file, LAX);
+    expect(warnings(messages)).toEqual([
+      "Warning: Merge Element: element/duration/pulse is in Element T1 but not Element T2.",
+      "Warning: Merge Element: element/extra is in Element T2 but not Element T1.",
+    ]);
+    expect(json().Element.element.duration).toBeUndefined();
+    expect(json().Element.element.extra).toBeUndefined();
+  });
+
+  it("reports a type mismatch between tiers, and leaves the variable out without strict", async () => {
+    const lo = changed(T2, "element/lo", (v) => Object.assign(v, { type: "FLOAT", values: [1, 2] }));
+    await expect(synced(lo, { ...TIERED, units: { "Element/element/lo": "none" } })).rejects.toThrow(
+      "Merge Element: element/lo is a color in Element T1 but a number in Element T2.",
+    );
+    const pulse = changed(T2, "element/duration/pulse", (v) => Object.assign(v, { type: "COLOR", values: ["#000000", "#ffffff"] }));
+    const { messages, json } = await synced(pulse, LAX);
+    expect(warnings(messages)).toEqual([
+      "Warning: Merge Element: element/duration/pulse is a duration in Element T1 but a color in Element T2.",
+    ]);
+    expect(json().Element.element.duration).toBeUndefined();
+  });
+
+  it("reports a unit mismatch between tiers, and leaves the variable out without strict", async () => {
+    const file = tieredFile();
+    file.collections[T1]!.variables.push({ name: "element/gap", type: "FLOAT", scopes: ["FONT_WEIGHT"], values: [4, 4] });
+    file.collections[T2]!.variables.push({ name: "element/gap", type: "FLOAT", scopes: ["GAP"], values: [4, 4] });
+    const message = "Merge Element: element/gap is a number in Element T1 but a dimension in Element T2.";
+    await expect(synced(file, TIERED)).rejects.toThrow(message);
+    const { messages, json } = await synced(file, LAX);
+    expect(warnings(messages)).toEqual([`Warning: ${message}`]);
+    expect(json().Element.element.gap).toBeUndefined();
+  });
+
+  it("reports a WEB code syntax mismatch, and keeps the first tier's syntax without strict", async () => {
+    const other = changed(T2, "element/lo", (v) => (v.web = "var(--el-lo)"));
+    await expect(synced(other, TIERED)).rejects.toThrow(
+      "Merge Element: element/lo has WEB code syntax var(--element-lo) in Element T1 but var(--el-lo) in Element T2.",
+    );
+    const none = changed(T2, "element/lo", (v) => delete v.web);
+    await expect(synced(none, TIERED)).rejects.toThrow(
+      "Merge Element: element/lo has WEB code syntax var(--element-lo) in Element T1 but none in Element T2.",
+    );
+    const lax = await synced(other, LAX);
+    expect(warnings(lax.messages)).toHaveLength(1);
+    expect(lax.json().Element.element.lo.$extensions["com.figma"]).toEqual({ codeSyntax: { WEB: "var(--element-lo)" } });
+    expect(lax.json().Element.element.lo.$extensions["figma-mcp-tokens"].modes.electric).toBe("#ffee00");
+
+    const first = changed(T2, "element/hi", (v) => (v.web = "var(--el-hi)"));
+    const { messages, json } = await synced(first, LAX);
+    expect(warnings(messages)).toEqual([
+      "Warning: Merge Element: element/hi has WEB code syntax none in Element T1 but var(--el-hi) in Element T2.",
+    ]);
+    expect(json().Element.element.hi).toEqual({
+      $type: "color",
+      $value: "#ffaa00",
+      $extensions: { "figma-mcp-tokens": { modes: { strength: "#ffffff" } } },
+    });
+  });
+
+  it("lists every inconsistency together with strict", async () => {
+    const file = without(tieredFile(), T2, "element/duration/pulse");
+    file.collections[T2]!.variables.find((v) => v.name === "element/lo")!.web = "var(--el-lo)";
+    Object.assign(file.collections[T2]!.variables.find((v) => v.name === "element/opacity/glow")!, {
+      type: "COLOR",
+      values: ["#000000", "#ffffff"],
+    });
+    await expect(synced(file, TIERED)).rejects.toThrow(
+      /3 problems:[\s\S]*element\/lo has WEB code syntax[\s\S]*element\/duration\/pulse is in Element T1 but not Element T2[\s\S]*element\/opacity\/glow is an opacity in Element T1 but a color in Element T2/,
+    );
+  });
+
+  it("always fails on a mode that's in two tiers", async () => {
+    const file = tieredFile();
+    file.collections[T2]!.modes = ["electric", "fire"];
+    await expect(synced(file, LAX)).rejects.toThrow("Merge Element: mode fire is in both Element T1 and Element T2; rename one.");
+  });
+
+  it("always fails on a tier collection that isn't in the file", async () => {
+    const merge = { Element: ["Element T1", "Element T2", "Element T3"] };
+    await expect(synced(tieredFile(), { ...LAX, merge })).rejects.toThrow(
+      "Merge Element: no collection named Element T3 in the Figma file.",
+    );
+  });
+
+  it("always fails on a merge named like a collection that isn't one of its tiers", async () => {
+    await expect(synced(tieredFile(), { ...LAX, merge: { Router: ["Element T1", "Element T2"] } })).rejects.toThrow(
+      "Merge Router: the name is taken by a collection in the Figma file; pick another merge name.",
+    );
+    const own = await synced(tieredFile(), { ...LAX, merge: { "Element T1": ["Element T1", "Element T2"] } });
+    expect(own.json()["Element T1"].$extensions["figma-mcp-tokens"].merged).toEqual(["Element T1", "Element T2"]);
+  });
+
+  it("reports a tier variable's own problems once per tier, naming the tier", async () => {
+    const file = tieredFile();
+    for (const tier of [T1, T2]) {
+      file.collections[tier]!.variables.push({ name: "element/brand", type: "COLOR", values: [alias("Brand/blue"), "#000000"] });
+    }
+    const both = await synced(file, LAX);
+    expect(warnings(both.messages)).toEqual([
+      "Warning: Element T1/element/brand aliases Brand/blue from a library; library variables aren't supported yet.",
+      "Warning: Element T2/element/brand aliases Brand/blue from a library; library variables aren't supported yet.",
+    ]);
+    expect(both.json().Element.element.brand).toBeUndefined();
+
+    const one = changed(T2, "element/hi", (v) => (v.values = [alias("Brand/blue"), "#ffffff"]));
+    without(one, T1, "element/accent");
+    without(one, T2, "element/accent");
+    one.effectStyles!.pop();
+    const { messages, json } = await synced(one, LAX);
+    expect(warnings(messages)).toEqual([
+      "Warning: Element T2/element/hi aliases Brand/blue from a library; library variables aren't supported yet.",
+    ]);
+    expect(json().Element.element.hi).toBeUndefined();
+  });
+});
+
 describe("build", () => {
   it("rebuilds the outputs from a hand-edited tokens.json", async () => {
     const { root, config, read } = await synced();
@@ -251,6 +549,38 @@ describe("build", () => {
     tokens.component.card.radius.$value = "{primitive.scale.99}";
     writeFileSync(path, JSON.stringify(tokens));
     expect(() => build(config)).toThrow(/\{primitive.scale.99\} points at no token/);
+  });
+
+  const mismatch = (keys: string) =>
+    `Warning: merge in the config doesn't match tokens.json (${keys}); export from Figma and run figma-mcp-tokens sync.`;
+
+  /** A synced tiered project whose config's merge is then changed to `merge`, without syncing. */
+  async function remerged(merge: Record<string, string[]>, options: Record<string, unknown> = {}) {
+    const { root, read } = await synced(tieredFile(), { ...TIERED, ...options });
+    const path = join(root, "figma-mcp-tokens.config.json");
+    writeFileSync(path, JSON.stringify({ ...JSON.parse(read("figma-mcp-tokens.config.json")), merge }));
+    return { root, config: loadConfig(path) };
+  }
+
+  it("warns when a merge key is added, removed or changed without syncing", async () => {
+    expect(build((await remerged({ ...TIERED.merge, Crop: ["Crop T1", "Crop T2"] })).config)).toEqual([mismatch("Crop"), "No changes."]);
+    expect(build((await remerged({})).config)).toEqual([mismatch("Element"), "No changes."]);
+    expect(build((await remerged({ Element: ["Element T2", "Element T1"] })).config)).toEqual([mismatch("Element"), "No changes."]);
+    expect(build((await remerged({ Element: ["Element T1"], Crop: ["Crop T1"] })).config)).toEqual([
+      mismatch("Element, Crop"),
+      "No changes.",
+    ]);
+  });
+
+  it("still writes the outputs with the warning under strict", async () => {
+    const { root, config } = await remerged({}, { strict: true });
+    rmSync(join(root, "tokens/tokens.css"));
+    expect(build(config)).toEqual([mismatch("Element"), "Wrote tokens/tokens.css"]);
+  });
+
+  it("doesn't warn when the config's merge matches tokens.json", async () => {
+    expect(build((await synced(tieredFile(), TIERED)).config)).toEqual(["No changes."]);
+    expect(build((await synced()).config)).toEqual(["No changes."]);
   });
 });
 
