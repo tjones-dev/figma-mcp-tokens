@@ -91,7 +91,15 @@ export function sync(config) {
         },
         ...toDtcg(dump, config, issues),
     };
-    const outputs = buildOutputs(tokens, config, issues);
+    let outputs;
+    try {
+        outputs = buildOutputs(tokens, config, issues);
+    }
+    catch (error) {
+        // A token left out for a problem breaks the aliases to it; with strict, report the problem.
+        issues.settle();
+        throw error;
+    }
     const warnings = issues.settle();
     const written = writeChanged([{ path: config.tokens, content: `${formatJson(tokens)}\n` }, ...outputs], config.root);
     return report(written, warnings);

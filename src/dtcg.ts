@@ -88,37 +88,59 @@ function reference(alias: string, merged: Merged): string {
   return `{${[tokenKey(merged.get(collection) ?? collection), ...tokenPath(name)].join(".")}}`;
 }
 
-/** Places a token in a nested group by its path. */
-function place(root: Group, path: string[], token: Token, where: string, issues: Issues) {
+/** Places a token in a nested group by its path; false if it can't, after reporting why. */
+function place(root: Group, path: string[], token: Token, where: string, issues: Issues): boolean {
   let group = root;
   for (const key of path.slice(0, -1)) {
     const next = (group[key] ??= {}) as Group;
     if ("$value" in next) {
       issues.add(`${where}: ${path.join("/")} is inside the token ${key}; rename one of them.`);
-      return;
+      return false;
     }
     group = next;
   }
   const last = path.at(-1) ?? "";
   if (last in group) {
     issues.add(`${where}: the name ${path.join("/")} is used twice; rename one of them.`);
-    return;
+    return false;
   }
   group[last] = token;
+  return true;
 }
 
-/** Every token in a group with its path, in order. */
-function leaves(group: Group, path: string[] = []): [string[], Token][] {
-  return Object.entries(group).flatMap(([key, node]): [string[], Token][] => {
-    if (key.startsWith("$") || typeof node !== "object" || node === null) return [];
-    return "$value" in node ? [[[...path, key], node as Token]] : leaves(node as Group, [...path, key]);
-  });
-}
+/** What a number variable is in each unit, for reporting a mismatch between tiers. */
+const KINDS: Record<NumberUnit, string> = {
+  px: "a dimension",
+  ms: "a duration",
+  none: "a number",
+  opacity: "an opacity",
+};
 
-function tokenAt(group: Group, path: string[]): Token | undefined {
-  let node: unknown = group;
-  for (const key of path) node = (node as Group | undefined)?.[key];
-  return typeof node === "object" && node !== null && "$value" in node ? (node as Token) : undefined;
+/**
+ * Problems that would drop or mix whole tiers fail the sync even without `strict`: a tier
+ * collection that isn't in the dump, a merge named like another collection, and a mode that's
+ * in two tiers of one merge.
+ */
+function checkMerges(dump: FigmaDump, config: Config) {
+  for (const [name, tiers] of Object.entries(config.merge)) {
+    const fail = (message: string) => {
+      throw new Error(`Merge ${name}: ${message}`);
+    };
+    for (const tier of tiers) {
+      if (!dump.collections[tier]) fail(`no collection named ${tier} in the Figma file.`);
+    }
+    if (Object.keys(dump.collections).some((c) => !tiers.includes(c) && tokenKey(c) === tokenKey(name))) {
+      fail("the name is taken by a collection in the Figma file; pick another merge name.");
+    }
+    const owners = new Map<string, string>();
+    for (const tier of tiers) {
+      for (const mode of dump.collections[tier]?.modes ?? []) {
+        const owner = owners.get(mode);
+        if (owner !== undefined) fail(`mode ${mode} is in both ${owner} and ${tier}; rename one.`);
+        owners.set(mode, tier);
+      }
+    }
+  }
 }
 
 function variables(dump: FigmaDump, config: Config, issues: Issues): Group {
@@ -139,7 +161,9 @@ function variables(dump: FigmaDump, config: Config, issues: Issues): Group {
     return units.get(`${owner}:${name}`);
   };
 
-  const collectionGroup = (collection: string, { modes, variables }: DumpCollection): Group => {
+  /** A tier's variables by name, for merging; `collectionGroup` adds each token it places. */
+  type Placed = Map<string, Token>;
+  const collectionGroup = (collection: string, { modes, variables }: DumpCollection, placed?: Placed): Group => {
     const group: Group = { $extensions: { [EXT]: { modes } } };
     for (const variable of variables) {
       const [name, type, web, , ...values] = variable;
@@ -183,36 +207,68 @@ function variables(dump: FigmaDump, config: Config, issues: Issues): Group {
         issues.add(`${where} ${message}`);
         continue;
       }
-      place(group, tokenPath(name), token, `Variable ${collection}`, issues);
+      if (place(group, tokenPath(name), token, `Variable ${collection}`, issues)) placed?.set(name, token);
     }
     return group;
+  };
+
+  /** "a color", "a duration", "an opacity", …: what a variable is in one tier, unit included. */
+  const kind = (tier: string, [name, type]: DumpVariable): string => {
+    if (type === "n") return KINDS[units.get(`${tier}:${name}`) ?? "px"];
+    return type in TYPES ? `a ${TYPES[type as keyof typeof TYPES]}` : `a ${type}`;
   };
 
   /**
    * One group for a merge: each tier is converted on its own (so problems name the tier), then
-   * each token takes its value in every mode from the tier that owns the mode.
+   * each token takes its value in every mode from the tier that owns the mode. A variable that
+   * isn't in every tier, or isn't the same type and unit in every tier, is reported and left
+   * out; one whose WEB code syntax differs is reported and keeps the first tier's.
    */
   const mergedGroup = (name: string, tiers: string[]): Group => {
-    const present = tiers.flatMap((tier) => {
-      const collection = dump.collections[tier];
-      return collection ? [{ modes: collection.modes, group: collectionGroup(tier, collection) }] : [];
+    const present = tiers.map((tier) => {
+      const collection = dump.collections[tier] as DumpCollection;
+      const placed: Placed = new Map();
+      collectionGroup(tier, collection, placed);
+      return { tier, modes: collection.modes, dumped: new Map(collection.variables.map((v) => [v[0], v])), placed };
     });
     const modes = present.flatMap((tier) => tier.modes);
     const group: Group = { $extensions: { [EXT]: { modes, merged: tiers } } };
-    for (const [path, first] of leaves(present[0]?.group ?? {})) {
-      const parts = present.map((tier) => tokenAt(tier.group, path));
-      if (parts.some((part) => part === undefined)) continue;
-      const values = present.flatMap((tier, i) => {
+    const names = new Set(present.flatMap(({ dumped }) => [...dumped.keys()]));
+    for (const variable of names) {
+      const problem = (message: string) => issues.add(`Merge ${name}: ${variable} ${message}`);
+      const owner = present.find(({ dumped }) => dumped.has(variable));
+      const missing = present.filter(({ dumped }) => !dumped.has(variable));
+      for (const { tier } of missing) problem(`is in ${owner?.tier} but not ${tier}.`);
+      if (!owner || missing.length > 0) continue;
+
+      const ownerVariable = owner.dumped.get(variable) as DumpVariable;
+      let consistent = true;
+      for (const { tier, dumped } of present.slice(1)) {
+        const tierVariable = dumped.get(variable) as DumpVariable;
+        const [first, other] = [kind(owner.tier, ownerVariable), kind(tier, tierVariable)];
+        if (first !== other) {
+          problem(`is ${first} in ${owner.tier} but ${other} in ${tier}.`);
+          consistent = false;
+        }
+        const [firstWeb, otherWeb] = [ownerVariable[2] ?? "none", tierVariable[2] ?? "none"];
+        if (firstWeb !== otherWeb) problem(`has WEB code syntax ${firstWeb} in ${owner.tier} but ${otherWeb} in ${tier}.`);
+      }
+      // A tier that couldn't convert the variable has already reported why.
+      const parts = present.map(({ placed }) => placed.get(variable));
+      if (!consistent || parts.some((part) => part === undefined)) continue;
+
+      const values = present.flatMap(({ modes }, i) => {
         const part = parts[i] as Token;
         const other = (part.$extensions?.[EXT]?.["modes"] ?? {}) as Record<string, unknown>;
-        return tier.modes.map((mode, m) => (m > 0 && mode in other ? other[mode] : part.$value));
+        return modes.map((mode, m) => (m > 0 && mode in other ? other[mode] : part.$value));
       });
-      const web = (first.$extensions?.["com.figma"]?.["codeSyntax"] as { WEB?: string } | undefined)?.WEB ?? null;
-      place(group, path, modeToken(first.$type, web, modes, values), `Variable ${name}`, issues);
+      const first = parts[0] as Token;
+      place(group, tokenPath(variable), modeToken(first.$type, ownerVariable[2], modes, values), `Variable ${name}`, issues);
     }
     return group;
   };
 
+  checkMerges(dump, config);
   const tokens: Group = {};
   const done = new Set<string>();
   for (const [collection, dumped] of Object.entries(dump.collections)) {

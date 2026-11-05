@@ -396,6 +396,145 @@ describe("merge", () => {
   });
 });
 
+describe("merge problems", () => {
+  const T1 = 3;
+  const T2 = 4;
+  /** The tiered file with `change` applied to the variable `name` in tier collection `tier`. */
+  const changed = (tier: number, name: string, change: (v: FakeFile["collections"][number]["variables"][number]) => void) => {
+    const file = tieredFile();
+    change(file.collections[tier]!.variables.find((v) => v.name === name)!);
+    return file;
+  };
+  const without = (file: FakeFile, tier: number, name: string) => {
+    const variables = file.collections[tier]!.variables;
+    variables.splice(variables.findIndex((v) => v.name === name), 1);
+    return file;
+  };
+  const warnings = (messages: string[]) => messages.filter((m) => m.startsWith("Warning:"));
+  const LAX = { ...TIERED, strict: false };
+
+  it("reports a variable missing from some tiers, and leaves it out without strict", async () => {
+    const file = without(tieredFile(), T2, "element/duration/pulse");
+    file.collections[T2]!.variables.push({ name: "element/extra", type: "COLOR", values: ["#000000", "#ffffff"] });
+    await expect(synced(file, TIERED)).rejects.toThrow(
+      /2 problems:\n {2}- Merge Element: element\/duration\/pulse is in Element T1 but not Element T2\.\n {2}- Merge Element: element\/extra is in Element T2 but not Element T1\.\n/,
+    );
+    const { messages, json } = await synced(file, LAX);
+    expect(warnings(messages)).toEqual([
+      "Warning: Merge Element: element/duration/pulse is in Element T1 but not Element T2.",
+      "Warning: Merge Element: element/extra is in Element T2 but not Element T1.",
+    ]);
+    expect(json().Element.element.duration).toBeUndefined();
+    expect(json().Element.element.extra).toBeUndefined();
+  });
+
+  it("reports a type mismatch between tiers, and leaves the variable out without strict", async () => {
+    const lo = changed(T2, "element/lo", (v) => Object.assign(v, { type: "FLOAT", values: [1, 2] }));
+    await expect(synced(lo, { ...TIERED, units: { "Element/element/lo": "none" } })).rejects.toThrow(
+      "Merge Element: element/lo is a color in Element T1 but a number in Element T2.",
+    );
+    const pulse = changed(T2, "element/duration/pulse", (v) => Object.assign(v, { type: "COLOR", values: ["#000000", "#ffffff"] }));
+    const { messages, json } = await synced(pulse, LAX);
+    expect(warnings(messages)).toEqual([
+      "Warning: Merge Element: element/duration/pulse is a duration in Element T1 but a color in Element T2.",
+    ]);
+    expect(json().Element.element.duration).toBeUndefined();
+  });
+
+  it("reports a unit mismatch between tiers, and leaves the variable out without strict", async () => {
+    const file = tieredFile();
+    file.collections[T1]!.variables.push({ name: "element/gap", type: "FLOAT", scopes: ["FONT_WEIGHT"], values: [4, 4] });
+    file.collections[T2]!.variables.push({ name: "element/gap", type: "FLOAT", scopes: ["GAP"], values: [4, 4] });
+    const message = "Merge Element: element/gap is a number in Element T1 but a dimension in Element T2.";
+    await expect(synced(file, TIERED)).rejects.toThrow(message);
+    const { messages, json } = await synced(file, LAX);
+    expect(warnings(messages)).toEqual([`Warning: ${message}`]);
+    expect(json().Element.element.gap).toBeUndefined();
+  });
+
+  it("reports a WEB code syntax mismatch, and keeps the first tier's syntax without strict", async () => {
+    const other = changed(T2, "element/lo", (v) => (v.web = "var(--el-lo)"));
+    await expect(synced(other, TIERED)).rejects.toThrow(
+      "Merge Element: element/lo has WEB code syntax var(--element-lo) in Element T1 but var(--el-lo) in Element T2.",
+    );
+    const none = changed(T2, "element/lo", (v) => delete v.web);
+    await expect(synced(none, TIERED)).rejects.toThrow(
+      "Merge Element: element/lo has WEB code syntax var(--element-lo) in Element T1 but none in Element T2.",
+    );
+    const lax = await synced(other, LAX);
+    expect(warnings(lax.messages)).toHaveLength(1);
+    expect(lax.json().Element.element.lo.$extensions["com.figma"]).toEqual({ codeSyntax: { WEB: "var(--element-lo)" } });
+    expect(lax.json().Element.element.lo.$extensions["figma-mcp-tokens"].modes.electric).toBe("#ffee00");
+
+    const first = changed(T2, "element/hi", (v) => (v.web = "var(--el-hi)"));
+    const { messages, json } = await synced(first, LAX);
+    expect(warnings(messages)).toEqual([
+      "Warning: Merge Element: element/hi has WEB code syntax none in Element T1 but var(--el-hi) in Element T2.",
+    ]);
+    expect(json().Element.element.hi).toEqual({
+      $type: "color",
+      $value: "#ffaa00",
+      $extensions: { "figma-mcp-tokens": { modes: { strength: "#ffffff" } } },
+    });
+  });
+
+  it("lists every inconsistency together with strict", async () => {
+    const file = without(tieredFile(), T2, "element/duration/pulse");
+    file.collections[T2]!.variables.find((v) => v.name === "element/lo")!.web = "var(--el-lo)";
+    Object.assign(file.collections[T2]!.variables.find((v) => v.name === "element/opacity/glow")!, {
+      type: "COLOR",
+      values: ["#000000", "#ffffff"],
+    });
+    await expect(synced(file, TIERED)).rejects.toThrow(
+      /3 problems:[\s\S]*element\/lo has WEB code syntax[\s\S]*element\/duration\/pulse is in Element T1 but not Element T2[\s\S]*element\/opacity\/glow is an opacity in Element T1 but a color in Element T2/,
+    );
+  });
+
+  it("always fails on a mode that's in two tiers", async () => {
+    const file = tieredFile();
+    file.collections[T2]!.modes = ["electric", "fire"];
+    await expect(synced(file, LAX)).rejects.toThrow("Merge Element: mode fire is in both Element T1 and Element T2; rename one.");
+  });
+
+  it("always fails on a tier collection that isn't in the file", async () => {
+    const merge = { Element: ["Element T1", "Element T2", "Element T3"] };
+    await expect(synced(tieredFile(), { ...LAX, merge })).rejects.toThrow(
+      "Merge Element: no collection named Element T3 in the Figma file.",
+    );
+  });
+
+  it("always fails on a merge named like a collection that isn't one of its tiers", async () => {
+    await expect(synced(tieredFile(), { ...LAX, merge: { Router: ["Element T1", "Element T2"] } })).rejects.toThrow(
+      "Merge Router: the name is taken by a collection in the Figma file; pick another merge name.",
+    );
+    const own = await synced(tieredFile(), { ...LAX, merge: { "Element T1": ["Element T1", "Element T2"] } });
+    expect(own.json()["Element T1"].$extensions["figma-mcp-tokens"].merged).toEqual(["Element T1", "Element T2"]);
+  });
+
+  it("reports a tier variable's own problems once per tier, naming the tier", async () => {
+    const file = tieredFile();
+    for (const tier of [T1, T2]) {
+      file.collections[tier]!.variables.push({ name: "element/brand", type: "COLOR", values: [alias("Brand/blue"), "#000000"] });
+    }
+    const both = await synced(file, LAX);
+    expect(warnings(both.messages)).toEqual([
+      "Warning: Element T1/element/brand aliases Brand/blue from a library; library variables aren't supported yet.",
+      "Warning: Element T2/element/brand aliases Brand/blue from a library; library variables aren't supported yet.",
+    ]);
+    expect(both.json().Element.element.brand).toBeUndefined();
+
+    const one = changed(T2, "element/hi", (v) => (v.values = [alias("Brand/blue"), "#ffffff"]));
+    without(one, T1, "element/accent");
+    without(one, T2, "element/accent");
+    one.effectStyles!.pop();
+    const { messages, json } = await synced(one, LAX);
+    expect(warnings(messages)).toEqual([
+      "Warning: Element T2/element/hi aliases Brand/blue from a library; library variables aren't supported yet.",
+    ]);
+    expect(json().Element.element.hi).toBeUndefined();
+  });
+});
+
 describe("build", () => {
   it("rebuilds the outputs from a hand-edited tokens.json", async () => {
     const { root, config, read } = await synced();
