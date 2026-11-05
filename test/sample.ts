@@ -90,6 +90,75 @@ export function sampleFile(): FakeFile {
   };
 }
 
+/**
+ * The sample plus one collection split into tier collections because of Figma's mode limit:
+ * `Element T1` (fire, water) and `Element T2` (electric, strength) hold the same variables, a
+ * `Router` collection (T1, T2) aliases each tier, and components and styles use them.
+ */
+export function tieredFile(): FakeFile {
+  const file = sampleFile();
+  const tier = (n: 1 | 2, modes: string[], values: Record<string, (string | number)[]>): FakeFile["collections"][number] => ({
+    name: `Element T${n}`,
+    modes,
+    variables: [
+      { name: "element/lo", type: "COLOR", web: "var(--element-lo)", values: values["lo"]! },
+      { name: "element/hi", type: "COLOR", values: values["hi"]! },
+      { name: "element/accent", type: "COLOR", values: modes.map(() => alias(`Element T${n}/element/hi`)) },
+      { name: "element/duration/pulse", type: "FLOAT", values: values["pulse"]! },
+      { name: "element/opacity/glow", type: "FLOAT", values: values["glow"]! },
+      { name: "element/size", type: "FLOAT", values: values["size"]! },
+    ],
+  });
+  file.collections.push(
+    tier(1, ["fire", "water"], {
+      lo: ["#ff4400", "#0066ff"],
+      hi: ["#ffaa00", "#ffaa00"],
+      pulse: [200, 300],
+      glow: [80, 60],
+      size: [12, 12],
+    }),
+    tier(2, ["electric", "strength"], {
+      lo: ["#ffee00", "#8b0000"],
+      hi: ["#ffaa00", "#ffffff"],
+      pulse: [100, 400],
+      glow: [80, 90],
+      size: [16, 12],
+    }),
+    {
+      name: "Router",
+      modes: ["T1", "T2"],
+      variables: ["lo", "size", "opacity/glow"].map((name) => ({
+        name: `element/${name}`,
+        type: name === "lo" ? ("COLOR" as const) : ("FLOAT" as const),
+        values: [alias(`Element T1/element/${name}`), alias(`Element T2/element/${name}`)],
+      })),
+    },
+  );
+  file.collections[2]!.variables.push(
+    { name: "badge/fill", type: "COLOR", values: [alias("Router/element/lo")] },
+    { name: "badge/size", type: "FLOAT", values: [alias("Router/element/size")] },
+  );
+  file.textStyles!.push({
+    name: "element/label",
+    family: "Inter",
+    style: "Bold",
+    size: 12,
+    lineHeight: { unit: "AUTO" },
+    bound: { fontSize: alias("Element T2/element/size") },
+  });
+  file.effectStyles!.push({
+    name: "shadow/element",
+    effects: [{ type: "DROP_SHADOW", color: "#000000", y: 2, blur: 4, bound: { color: alias("Element T1/element/hi") } }],
+  });
+  return file;
+}
+
+/** The config options that merge the tiers in `tieredFile()` and keep the router out of the outputs. */
+export const TIERED = {
+  merge: { Element: ["Element T1", "Element T2"] },
+  primitives: ["primitive", "Router"],
+};
+
 /** A project folder with a config holding `options`, and its loaded config. */
 export function project(options: Record<string, unknown> = {}) {
   const root = mkdtempSync(join(tmpdir(), "fmt-test-"));

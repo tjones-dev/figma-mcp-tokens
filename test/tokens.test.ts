@@ -5,7 +5,7 @@ import { describe, expect, it } from "vitest";
 import { build, init, sync } from "../src/commands.js";
 import { figmaFileKey, loadConfig } from "../src/config.js";
 import { alias, exportAll, runExport, type FakeFile } from "./fake-figma.js";
-import { project, sampleFile } from "./sample.js";
+import { project, sampleFile, TIERED, tieredFile } from "./sample.js";
 
 async function synced(file: FakeFile = sampleFile(), options: Record<string, unknown> = {}) {
   const { root, config } = project(options);
@@ -26,6 +26,39 @@ describe("config", () => {
   it("refuses unknown options", () => {
     expect(() => project({ output: {} })).toThrow(/unknown option output/);
     expect(() => project({ css: { selectr: ":root" } })).toThrow(/unknown option css.selectr/);
+  });
+
+  it("merges nothing by default", () => {
+    expect(project().config.merge).toEqual({});
+    expect(project(TIERED).config.merge).toEqual(TIERED.merge);
+  });
+
+  it("refuses a wrongly shaped merge", () => {
+    const error = (merge: unknown) => () => project({ merge });
+    expect(error([])).toThrow("figma-mcp-tokens.config.json: merge must be an object.");
+    const list = "figma-mcp-tokens.config.json: merge.Element must be a list of collection names.";
+    expect(error({ Element: "Element T1" })).toThrow(list);
+    expect(error({ Element: [] })).toThrow(list);
+    expect(error({ Element: ["Element T1", ""] })).toThrow(list);
+    expect(error({ Element: ["Element T1", 2] })).toThrow(list);
+    expect(error({ Element: ["Element T1"], Crop: null })).toThrow(
+      "figma-mcp-tokens.config.json: merge.Crop must be a list of collection names.",
+    );
+  });
+
+  it("refuses a collection listed in merge more than once", () => {
+    const twice = "figma-mcp-tokens.config.json: Element T2 is listed in merge more than once.";
+    expect(() => project({ merge: { Element: ["Element T1", "Element T2", "Element T2"] } })).toThrow(twice);
+    expect(() => project({ merge: { Element: ["Element T1", "Element T2"], Crop: ["Element T2"] } })).toThrow(twice);
+  });
+
+  it("refuses a merge named like a style group", () => {
+    expect(() => project({ merge: { text: ["Text T1", "Text T2"] } })).toThrow(
+      "figma-mcp-tokens.config.json: merge.text is a reserved name; pick another.",
+    );
+    expect(() => project({ merge: { effect: ["Effect T1"] } })).toThrow(
+      "figma-mcp-tokens.config.json: merge.effect is a reserved name; pick another.",
+    );
   });
 });
 
@@ -234,6 +267,132 @@ describe("strictness", () => {
     const file = sampleFile();
     file.collections[2]!.variables.push({ name: "radius", type: "FLOAT", web: "var(--radius-lg)", values: [3] });
     await expect(synced(file)).rejects.toThrow(/--radius-lg is also semantic.radius.lg's/);
+  });
+});
+
+describe("merge", () => {
+  const moduleTokens = (ts: string) => JSON.parse(ts.slice(ts.indexOf("{"), ts.lastIndexOf("}") + 1));
+
+  it("can't export tier collections without merging them", async () => {
+    await expect(synced(tieredFile(), { primitives: TIERED.primitives })).rejects.toThrow(
+      /--element-lo is also Element T1.element.lo's/,
+    );
+  });
+
+  it("writes one group for the tiers, with every tier's modes and the first as default", async () => {
+    const { json } = await synced(tieredFile(), TIERED);
+    const tokens = json();
+    expect(tokens["Element T1"]).toBeUndefined();
+    expect(tokens["Element T2"]).toBeUndefined();
+    expect(tokens.Element).toEqual({
+      $extensions: {
+        "figma-mcp-tokens": { modes: ["fire", "water", "electric", "strength"], merged: ["Element T1", "Element T2"] },
+      },
+      element: {
+        lo: {
+          $type: "color",
+          $value: "#ff4400",
+          $extensions: {
+            "com.figma": { codeSyntax: { WEB: "var(--element-lo)" } },
+            "figma-mcp-tokens": { modes: { water: "#0066ff", electric: "#ffee00", strength: "#8b0000" } },
+          },
+        },
+        hi: { $type: "color", $value: "#ffaa00", $extensions: { "figma-mcp-tokens": { modes: { strength: "#ffffff" } } } },
+        accent: { $type: "color", $value: "{Element.element.hi}" },
+        duration: {
+          pulse: {
+            $type: "duration",
+            $value: "200ms",
+            $extensions: { "figma-mcp-tokens": { modes: { water: "300ms", electric: "100ms", strength: "400ms" } } },
+          },
+        },
+        opacity: {
+          glow: { $type: "number", $value: 0.8, $extensions: { "figma-mcp-tokens": { modes: { water: 0.6, strength: 0.9 } } } },
+        },
+        size: { $type: "dimension", $value: "12px", $extensions: { "figma-mcp-tokens": { modes: { electric: "16px" } } } },
+      },
+    });
+  });
+
+  it("rewrites aliases into the tiers to the merged group", async () => {
+    const { json } = await synced(tieredFile(), TIERED);
+    const tokens = json();
+    expect(tokens.Router.element.lo).toEqual({ $type: "color", $value: "{Element.element.lo}" });
+    expect(tokens.Router.element.size).toEqual({ $type: "dimension", $value: "{Element.element.size}" });
+    expect(tokens.component.badge.fill).toEqual({ $type: "color", $value: "{Router.element.lo}" });
+    expect(tokens.text.element.label.$value.fontSize).toBe("{Element.element.size}");
+    expect(tokens.effect.shadow.element.$value[0].color).toBe("{Element.element.hi}");
+  });
+
+  it("writes one CSS property and module key per variable, with every other mode as a theme", async () => {
+    const { read } = await synced(tieredFile(), TIERED);
+    const css = read("tokens/tokens.css");
+    expect(css.match(/--element-lo:/g)).toHaveLength(4);
+    expect(css).toContain(":root {\n  --color-surface-page: #fffbf2;");
+    const root = css.slice(css.indexOf(":root"), css.indexOf("}"));
+    expect(root).toContain("--element-lo: #ff4400;");
+    expect(root).toContain("--element-duration-pulse: 200ms;");
+    expect(root).toContain("--badge-fill: #ff4400;");
+    expect(root).toContain("--text-element-label: 700 12px/normal Inter;");
+    const electric = css.slice(css.indexOf('[data-theme="electric"]'));
+    expect(electric.slice(0, electric.indexOf("}") + 1)).toBe(
+      [
+        '[data-theme="electric"] {',
+        "  --badge-fill: #ffee00;",
+        "  --badge-size: 16px;",
+        "  --element-lo: #ffee00;",
+        "  --element-duration-pulse: 100ms;",
+        "  --element-size: 16px;",
+        "  --text-element-label: 700 16px/normal Inter;",
+        "}",
+      ].join("\n"),
+    );
+    expect(css).toContain('[data-theme="water"]');
+    expect(css).toMatch(/\[data-theme="strength"\] \{[^}]*--element-lo: #8b0000;/);
+    expect(css).not.toMatch(/router|-t1|-t2|"t1"|"t2"/i);
+
+    const tokens = moduleTokens(read("tokens/tokens.ts"));
+    expect(tokens.element.lo).toBe("#ff4400");
+    expect(tokens.element.duration.pulse).toBe(200);
+    expect(tokens.badge).toEqual({ fill: "#ff4400", size: 12 });
+    expect(tokens.$modes.electric.element.lo).toBe("#ffee00");
+    expect(tokens.$modes.electric.badge).toEqual({ fill: "#ffee00", size: 16 });
+    expect(tokens.$modes.strength.badge).toEqual({ fill: "#8b0000" });
+    expect(Object.keys(tokens.$modes)).toEqual(["dark", "water", "electric", "strength"]);
+  });
+
+  it("matches units globs against the merged name, not the tier names", async () => {
+    const merged = await synced(tieredFile(), { ...TIERED, units: { "Element/element/size": "none" } });
+    expect(merged.json().Element.element.size).toEqual({
+      $type: "number",
+      $value: 12,
+      $extensions: { "figma-mcp-tokens": { modes: { electric: 16 } } },
+    });
+    const tier = await synced(tieredFile(), { ...TIERED, units: { "Element T1/element/size": "none" } });
+    expect(tier.json().Element.element.size.$value).toBe("12px");
+  });
+
+  it("checks an opacity alias against the merged token's unit", async () => {
+    const file = tieredFile();
+    file.collections[2]!.variables.push({
+      name: "badge/alpha",
+      type: "FLOAT",
+      scopes: ["OPACITY"],
+      values: [alias("Element T2/element/opacity/glow")],
+    });
+    const { json } = await synced(file, TIERED);
+    expect(json().component.badge.alpha).toEqual({ $type: "number", $value: "{Element.element.opacity.glow}" });
+    await expect(synced(file, { ...TIERED, units: { "Element T2/element/opacity/*": "none" } })).resolves.toBeTruthy();
+    await expect(synced(file, { ...TIERED, units: { "Element/element/opacity/*": "none" } })).rejects.toThrow(
+      /component\/badge\/alpha aliases Element T2\/element\/opacity\/glow, but only one of them is an opacity/,
+    );
+  });
+
+  it("keeps the router in tokens.json but out of the outputs when it's a primitive", async () => {
+    const { json, read } = await synced(tieredFile(), TIERED);
+    expect(json().Router.$extensions["figma-mcp-tokens"].modes).toEqual(["T1", "T2"]);
+    expect(read("tokens/tokens.css")).not.toMatch(/router/i);
+    expect(moduleTokens(read("tokens/tokens.ts")).$modes.T1).toBeUndefined();
   });
 });
 
