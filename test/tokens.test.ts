@@ -550,6 +550,38 @@ describe("build", () => {
     writeFileSync(path, JSON.stringify(tokens));
     expect(() => build(config)).toThrow(/\{primitive.scale.99\} points at no token/);
   });
+
+  const mismatch = (keys: string) =>
+    `Warning: merge in the config doesn't match tokens.json (${keys}); export from Figma and run figma-mcp-tokens sync.`;
+
+  /** A synced tiered project whose config's merge is then changed to `merge`, without syncing. */
+  async function remerged(merge: Record<string, string[]>, options: Record<string, unknown> = {}) {
+    const { root, read } = await synced(tieredFile(), { ...TIERED, ...options });
+    const path = join(root, "figma-mcp-tokens.config.json");
+    writeFileSync(path, JSON.stringify({ ...JSON.parse(read("figma-mcp-tokens.config.json")), merge }));
+    return { root, config: loadConfig(path) };
+  }
+
+  it("warns when a merge key is added, removed or changed without syncing", async () => {
+    expect(build((await remerged({ ...TIERED.merge, Crop: ["Crop T1", "Crop T2"] })).config)).toEqual([mismatch("Crop"), "No changes."]);
+    expect(build((await remerged({})).config)).toEqual([mismatch("Element"), "No changes."]);
+    expect(build((await remerged({ Element: ["Element T2", "Element T1"] })).config)).toEqual([mismatch("Element"), "No changes."]);
+    expect(build((await remerged({ Element: ["Element T1"], Crop: ["Crop T1"] })).config)).toEqual([
+      mismatch("Element, Crop"),
+      "No changes.",
+    ]);
+  });
+
+  it("still writes the outputs with the warning under strict", async () => {
+    const { root, config } = await remerged({}, { strict: true });
+    rmSync(join(root, "tokens/tokens.css"));
+    expect(build(config)).toEqual([mismatch("Element"), "Wrote tokens/tokens.css"]);
+  });
+
+  it("doesn't warn when the config's merge matches tokens.json", async () => {
+    expect(build((await synced(tieredFile(), TIERED)).config)).toEqual(["No changes."]);
+    expect(build((await synced()).config)).toEqual(["No changes."]);
+  });
 });
 
 describe("init", () => {
