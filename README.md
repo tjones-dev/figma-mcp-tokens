@@ -48,8 +48,8 @@ truncated, copied wrongly, or left over from a different export. A design system
 The package isn't on npm. Install it from GitHub, pinned to a tag:
 
 ```sh
-pnpm add -D github:tjones-dev/figma-mcp-tokens#v0.2.0
-# or: npm i -D github:tjones-dev/figma-mcp-tokens#v0.2.0
+pnpm add -D github:tjones-dev/figma-mcp-tokens#v0.3.0
+# or: npm i -D github:tjones-dev/figma-mcp-tokens#v0.3.0
 ```
 
 The repo is private, so the machine needs GitHub access over SSH or through
@@ -162,6 +162,14 @@ different config file. Paths in the config are relative to the config file.
   // Collections that stay in tokens.json but are left out of the outputs.
   "primitives": ["primitive"],
 
+  // Tier collections to merge into one merged collection: each key is the merged
+  // collection's name, each value its tier collections in order. The modes are every tier's
+  // modes in that order, and the first tier's first mode is the default. Changing it needs
+  // a fresh export and sync. See "Tier collections".
+  "merge": {
+    // "Element": ["Element T1", "Element T2"]
+  },
+
   "css": {
     // Prepended to every custom property name: "ds" → --ds-color-surface-page.
     "prefix": "",
@@ -235,6 +243,56 @@ that name, and to every token that aliases into one, so a `component` token poin
 
 The module holds the default values, and what differs in each other mode under
 `tokens.$modes.<mode>`.
+
+### Tier collections
+
+Figma limits how many modes a collection can have. A design system that needs more splits
+one collection into **tier collections**: collections that hold the same variables but
+different modes (`Element T1` with `fire` and `water`, `Element T2` with `electric` and
+`strength`). A **router collection** then has one mode per tier, and its variables alias
+into that tier. Exported as is, the tiers clash, because both want `--element-lo` and
+`element.lo`.
+
+List the tiers under `merge` to turn them into one **merged collection**, and put the
+router in `primitives`:
+
+```json
+{
+  "merge": { "Element": ["Element T1", "Element T2"] },
+  "primitives": ["primitive", "Router"]
+}
+```
+
+- `sync` writes one `Element` group to `tokens.json` in place of the tiers, and the tiers
+  appear nowhere else. Its modes are every tier's modes in the order listed: `fire`,
+  `water`, `electric`, `strength`. Mode names aren't changed.
+- The first tier's first mode (`fire`) is the default: it goes under `css.selector` and is
+  the module's base values. Every other mode is an ordinary theme
+  (`[data-theme="electric"]`, `tokens.$modes.electric`).
+- Each token takes its value in each mode from the tier that has that mode. It has one CSS
+  name and one module path: `--element-lo`, `element.lo`.
+- Aliases into a tier point at the merged collection: `{Element T1.element.lo}` and
+  `{Element T2.element.lo}` both become `{Element.element.lo}`. That covers aliases from
+  other collections, from within the tiers, and from bound text and effect style fields.
+- `units` globs match the merged name (`"Element/element/*"`), not a tier name.
+- The group records its tiers in `$extensions["figma-mcp-tokens"].merged`.
+
+**The router goes in `primitives`.** Routers aren't detected or checked. Listed in
+`primitives`, the router stays in `tokens.json` but is left out of the outputs. A token
+that aliases the router, such as a component color, resolves through it to the merged
+token, so it changes with every tier's themes.
+
+**The tiers have to agree.** Every tier needs the same variables, each with the same type,
+unit and WEB code syntax. With `strict: true`, any difference fails `sync`. With
+`strict: false`, a variable that's missing from a tier, or has a different type or unit in
+one, is left out with a warning. A WEB code syntax difference keeps the first tier's syntax
+with a warning. Three things always fail, whatever `strict` says, because they'd drop or
+mix whole tiers: a tier collection that isn't in the Figma file, a mode in two tiers, and a
+merge named like a collection that isn't one of its tiers.
+
+**Changing `merge` needs a fresh sync.** The merge happens in `sync`, and `build` reads
+`tokens.json` as is. After adding, removing or changing a merge, export from Figma and run
+`sync`. Until then, `build` warns that the config doesn't match `tokens.json`.
 
 ### Text styles
 
@@ -381,6 +439,57 @@ the config is wrong.
 
 **"N problems: …"**: things this tool can't express yet. Change them in Figma, or set
 `"strict": false` to skip them with a warning.
+
+**"… its CSS name --element-lo is also Element T1.element.lo's …"** for tier collections:
+the tiers aren't merged. List them under `merge`, as described in
+[Tier collections](#tier-collections).
+
+### Merge config errors
+
+**"figma-mcp-tokens.config.json: merge must be an object."** and **"merge.Element must be a
+list of collection names."**: write `merge` as `{ "Element": ["Element T1", "Element T2"] }`.
+Each list needs at least one collection name, and no name can be empty.
+
+**"figma-mcp-tokens.config.json: Element T2 is listed in merge more than once."**: a
+collection can be a tier of only one merge, and only once. Remove the extra entry.
+
+**"figma-mcp-tokens.config.json: merge.text is a reserved name; pick another."**: `text`
+and `effect` hold the text and effect styles. Name the merge something else.
+
+### Merge sync errors
+
+These fail `sync` even with `strict: false`.
+
+**"Merge Element: no collection named Element T2 in the Figma file."**: a tier collection
+was renamed or deleted in Figma, or is misspelled in `merge`. Fix the name in the config
+or in Figma, then export and sync again.
+
+**"Merge Element: mode fire is in both Element T1 and Element T2; rename one."**: each mode
+has to be in only one tier. Rename the mode in one of the tiers in Figma, then export and
+sync again.
+
+**"Merge Element: the name is taken by a collection in the Figma file; pick another merge
+name."**: a collection that isn't one of the merge's tiers already has that name. Rename
+the merge key in the config.
+
+These are listed under "N problems: …". They fail `sync` with `strict: true`, and are
+warnings with `strict: false`:
+
+- **"Merge Element: element/lo is in Element T1 but not Element T2."**: add the variable to
+  every tier, or delete it from all of them. Without `strict`, it's left out.
+- **"Merge Element: element/lo is a color in Element T1 but a number in Element T2."**: the
+  type or unit differs between tiers. Make them the same in Figma, or give the variable a
+  unit with a `units` glob on the merged name. Without `strict`, it's left out.
+- **"Merge Element: element/lo has WEB code syntax var(--element-lo) in Element T1 but
+  var(--el-lo) in Element T2."** (`none` when a tier has none): give every tier the same
+  WEB code syntax. Without `strict`, the first tier's is used.
+
+### Merge build warning
+
+**"Warning: merge in the config doesn't match tokens.json (Element); export from Figma and
+run figma-mcp-tokens sync."**: `merge` was added, removed or changed since the last
+`sync`, for the merges named in brackets. `build` still writes the outputs from
+`tokens.json` as is. Export from Figma and run `sync` to apply the new `merge`.
 
 **A variable has the wrong unit**: give it the right scope in Figma, or add it to `units`
 in the config.
